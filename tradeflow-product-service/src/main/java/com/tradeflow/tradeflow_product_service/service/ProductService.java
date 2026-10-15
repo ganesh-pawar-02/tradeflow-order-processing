@@ -6,6 +6,8 @@ import com.tradeflow.tradeflow_product_service.entity.Product;
 import com.tradeflow.tradeflow_product_service.repository.ProductRepository;
 import org.modelmapper.ModelMapper;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cache.annotation.CachePut;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -28,16 +30,19 @@ public class ProductService {
         return modelMapper.map(savedProduct,ProductResponse.class);
     }
 
+    @Cacheable(cacheNames = "products", key = "#id")
     public ProductResponse findProduct(Long id){
         Product product= productRepository.findById(id).get();
         return modelMapper.map(product,ProductResponse.class);
     }
 
+    @Cacheable(cacheNames = "productList")
     public List<ProductResponse> getAll(){
         List<Product> list=productRepository.findAll();
         return list.stream().map(e->modelMapper.map(e,ProductResponse.class)).toList();
     }
 
+    @CachePut(cacheNames = "products", key = "#id")
     public ProductResponse updateProduct(Long id,ProductDto productDto){
         Product product=productRepository.findById(id).get();
         product.setName(productDto.getName());
@@ -48,6 +53,7 @@ public class ProductService {
         return modelMapper.map(savedProduct,ProductResponse.class);
 
     }
+    @CachePut(cacheNames = "products", key = "#id")
     public ProductResponse updateProduct(Long id,Integer stock){
         Product product=productRepository.findById(id).get();
         product.setStockQuantity(stock);
