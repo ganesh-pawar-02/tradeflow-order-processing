@@ -4,19 +4,16 @@ import java.math.BigDecimal;
 
 public class ProductResponse{
     Long id;
-
-    public Long getId() {
-        return id;
-    }
-
-    public void setId(Long id) {
-        this.id = id;
-    }
-
     String name;
     BigDecimal price;
     Integer stockQuantity;
     String category;
+
+public Long getId() {return id;}
+
+public void setId(Long id) {
+        this.id = id;
+    }
 
 public BigDecimal getPrice() {
     return price;

@@ -16,6 +16,17 @@ public class Product {
     BigDecimal price;
     Integer stockQuantity;
 
+    @Version
+    private Long version;
+
+    public Long getVersion() {
+        return version;
+    }
+
+    public void setVersion(Long version) {
+        this.version = version;
+    }
+
     public String getCategory() {
         return category;
     }
