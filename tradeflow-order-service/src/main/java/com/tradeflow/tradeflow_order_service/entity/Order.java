@@ -1,3 +1,4 @@
+
 package com.tradeflow.tradeflow_order_service.entity;
 
 import jakarta.persistence.*;
@@ -22,7 +23,7 @@ public class Order {
     private BigDecimal totalAmount;
 
     @Enumerated(EnumType.STRING)
-    @Column(nullable = false, length = 20)
+    @Column(nullable = false, length = 30)
     private OrderStatus status = OrderStatus.PENDING;
 
     @OneToMany(mappedBy = "order", cascade = CascadeType.ALL, orphanRemoval = true)
@@ -33,6 +34,20 @@ public class Order {
 
     @Column(nullable = false)
     private Instant updatedAt;
+
+    // Used to schedule the next Saga recovery attempt.
+    @Column(name = "next_retry_at")
+    private Instant nextRetryAt;
+
+    // Protects against stale concurrent entity updates.
+    @Version
+    private Long version;
+
+    @Column(name = "recovery_token", length = 36)
+    private String recoveryToken;
+
+    @Column(name = "recovery_lease_until")
+    private Instant recoveryLeaseUntil;
 
     @PrePersist
     protected void onCreate() {
@@ -56,12 +71,20 @@ public class Order {
         item.setOrder(null);
     }
 
-    public Long getCustomerId() {
-        return customerId;
+    public String getRecoveryToken() {
+        return recoveryToken;
     }
 
-    public void setCustomerId(Long customerId) {
-        this.customerId = customerId;
+    public void setRecoveryToken(String recoveryToken) {
+        this.recoveryToken = recoveryToken;
+    }
+
+    public Instant getRecoveryLeaseUntil() {
+        return recoveryLeaseUntil;
+    }
+
+    public void setRecoveryLeaseUntil(Instant recoveryLeaseUntil) {
+        this.recoveryLeaseUntil = recoveryLeaseUntil;
     }
 
     public Long getId() {
@@ -70,6 +93,14 @@ public class Order {
 
     public void setId(Long id) {
         this.id = id;
+    }
+
+    public Long getCustomerId() {
+        return customerId;
+    }
+
+    public void setCustomerId(Long customerId) {
+        this.customerId = customerId;
     }
 
     public BigDecimal getTotalAmount() {
@@ -93,22 +124,30 @@ public class Order {
     }
 
     public void setItems(List<OrderItem> items) {
-        this.items = items;
+        this.items.clear();
+
+        if (items != null) {
+            items.forEach(this::addItem);
+        }
     }
 
     public Instant getCreatedAt() {
         return createdAt;
     }
 
-    public void setCreatedAt(Instant createdAt) {
-        this.createdAt = createdAt;
-    }
-
     public Instant getUpdatedAt() {
         return updatedAt;
     }
 
-    public void setUpdatedAt(Instant updatedAt) {
-        this.updatedAt = updatedAt;
+    public Instant getNextRetryAt() {
+        return nextRetryAt;
+    }
+
+    public void setNextRetryAt(Instant nextRetryAt) {
+        this.nextRetryAt = nextRetryAt;
+    }
+
+    public Long getVersion() {
+        return version;
     }
 }

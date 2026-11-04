@@ -1,35 +1,64 @@
 package com.tradeflow.tradeflow_order_service.service;
 
 import java.math.BigDecimal;
-import java.util.ArrayList;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
+import java.util.UUID;
 
+import com.tradeflow.tradeflow_order_service.client.ProductClient;
 import com.tradeflow.tradeflow_order_service.client.dto.ProductResponse;
-import org.apache.kafka.common.errors.ResourceNotFoundException;
+import com.tradeflow.tradeflow_order_service.client.dto.InventoryReservationRequest;
+import com.tradeflow.tradeflow_order_service.client.dto.InventoryReservationResponse;
+import com.tradeflow.tradeflow_order_service.client.dto.InventoryReservationStatus;
+
+import com.tradeflow.tradeflow_order_service.dto.*;
+import com.tradeflow.tradeflow_order_service.entity.*;
+import com.tradeflow.tradeflow_order_service.event.OrderConfirmedEvent;
+import com.tradeflow.tradeflow_order_service.event.OrderEventPublisher;
+import com.tradeflow.tradeflow_order_service.repository.OrderRepository;
+
+import feign.FeignException;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import com.tradeflow.tradeflow_order_service.client.ProductClient;
-import com.tradeflow.tradeflow_order_service.dto.*;
-import com.tradeflow.tradeflow_order_service.entity.*;
-import com.tradeflow.tradeflow_order_service.repository.OrderRepository;
-
-
 @Service
 public class OrderService {
 
+    private static final Duration INITIAL_RETRY_DELAY =
+            Duration.ofSeconds(60);
+
     private final OrderRepository orderRepository;
     private final ProductClient productClient;
+    private final OrderSagaPersistenceService persistenceService;
+    private static final Logger log = LoggerFactory.getLogger(OrderService.class);
 
-    public OrderService(OrderRepository orderRepository, ProductClient productClient) {
+    public OrderService(
+            OrderRepository orderRepository,
+            ProductClient productClient,
+            OrderSagaPersistenceService persistenceService) {
+
         this.orderRepository = orderRepository;
         this.productClient = productClient;
+        this.persistenceService = persistenceService;
     }
 
-    @Transactional
+    /*
+     * Saga orchestrator.
+     *
+     * Intentionally NOT @Transactional:
+     * Feign calls must not run inside a long database transaction.
+     */
     public OrderResponse createOrder(CreateOrderRequest request) {
+
+        // --------------------------------------------------
+        // PHASE 1: FETCH PRODUCT INFORMATION AND PREPARE ORDER
+        // --------------------------------------------------
 
         Order order = new Order();
 
@@ -38,69 +67,334 @@ public class OrderService {
 
         BigDecimal totalAmount = BigDecimal.ZERO;
 
-        List<OrderItemResponse> itemResponses = new ArrayList<>();
-
         for (OrderItemRequest itemRequest : request.items()) {
 
-            ProductResponse product = productClient.getProduct(itemRequest.productId());
+            ProductResponse product =
+                    productClient.getProduct(itemRequest.productId());
 
-            // Validate product status
-            if (!"ACTIVE".equalsIgnoreCase(product.status())) {
-                throw new IllegalArgumentException("Product is not active: " + product.id());
-            }
-
-            // Validate stock
-            if (product.stockQuantity() < itemRequest.quantity()) {
-                throw new IllegalArgumentException("Insufficient stock for product: " + product.id());
-            }
-
-            // Calculate subtotal
-            BigDecimal subtotal = product.price().multiply(BigDecimal.valueOf(itemRequest.quantity()));
+            BigDecimal subtotal = product.price()
+                    .multiply(BigDecimal.valueOf(itemRequest.quantity()));
 
             totalAmount = totalAmount.add(subtotal);
 
-            // Create OrderItem
-            OrderItem orderItem = new OrderItem();
+            OrderItem item = new OrderItem();
 
-            orderItem.setProductId(product.id());
-            orderItem.setProductName(product.name());
-            orderItem.setUnitPrice(product.price());
-            orderItem.setQuantity(itemRequest.quantity());
-            orderItem.setSubtotal(subtotal);
+            item.setProductId(product.id());
+            item.setProductName(product.name());
+            item.setUnitPrice(product.price());
+            item.setQuantity(itemRequest.quantity());
+            item.setSubtotal(subtotal);
 
-            order.addItem(orderItem);
+            // Generate once and persist before reservation calls.
+            // Every retry must reuse this same reservation ID.
+            item.setReservationId(UUID.randomUUID().toString());
 
-            itemResponses.add(
-                    new OrderItemResponse(
-                            product.id(),
-                            product.name(),
-                            product.price(),
-                            itemRequest.quantity(),
-                            subtotal
-                    )
+            item.setReservationStatus(
+                    OrderItemReservationStatus.NOT_RESERVED
             );
+
+            order.addItem(item);
         }
 
         order.setTotalAmount(totalAmount);
 
-        Order savedOrder = orderRepository.save(order);
+        // --------------------------------------------------
+        // PHASE 2: PERSIST PENDING ORDER
+        // --------------------------------------------------
 
-        return new OrderResponse(
-                savedOrder.getId(),
-                savedOrder.getCustomerId(),
-                savedOrder.getTotalAmount(),
-                savedOrder.getStatus(),
-                itemResponses,
-                savedOrder.getCreatedAt(),
-                savedOrder.getUpdatedAt()
+        Long orderId = persistenceService.createPendingOrder(order);
+
+        // --------------------------------------------------
+        // PHASE 3: RESERVE ALL INVENTORY
+        // --------------------------------------------------
+
+        for (OrderItem item : order.getItems()) {
+
+            try {
+
+                InventoryReservationRequest reservationRequest =
+                        new InventoryReservationRequest(
+                                UUID.fromString(item.getReservationId()),
+                                orderId,
+                                item.getProductId(),
+                                item.getQuantity()
+                        );
+
+                InventoryReservationResponse response =
+                        productClient.reserveInventory(
+                                item.getProductId(),
+                                reservationRequest
+                        );
+
+                if (response == null
+                        || response.status()
+                        != InventoryReservationStatus.RESERVED) {
+
+                    // Unexpected response: do not assume that the
+                    // remote reservation failed.
+                    scheduleInitialRetry(orderId);
+
+                    return toResponse(
+                            persistenceService.findOrder(orderId)
+                    );
+                }
+
+                persistenceService.updateItemReservationStatus(
+                        orderId,
+                        item.getReservationId(),
+                        OrderItemReservationStatus.RESERVED
+                );
+
+            } catch (FeignException ex) {
+
+                if (isDefinitiveReservationRejection(ex)) {
+
+                    // A definitive business rejection means this
+                    // order cannot proceed with its current request.
+                    boolean compensationCompleted =
+                            compensateReservations(
+                                    orderId,
+                                    order.getItems()
+                            );
+
+                    persistenceService.updateOrderStatus(
+                            orderId,
+                            compensationCompleted
+                                    ? OrderStatus.CANCELLED
+                                    : OrderStatus.COMPENSATION_REQUIRED
+                    );
+
+                    return toResponse(
+                            persistenceService.findOrder(orderId)
+                    );
+                }
+
+                /*
+                 * A timeout, service-unavailable response, or server
+                 * error does not prove that the remote reservation
+                 * failed. The Product Service may have completed it.
+                 *
+                 * Keep PENDING and retry with the same reservation ID.
+                 */
+                scheduleInitialRetry(orderId);
+
+                return toResponse(
+                        persistenceService.findOrder(orderId)
+                );
+
+            } catch (RuntimeException ex) {
+
+                /*
+                 * This also covers unexpected local processing failures.
+                 * Do not assume the remote reservation did not happen.
+                 */
+                scheduleInitialRetry(orderId);
+
+                return toResponse(
+                        persistenceService.findOrder(orderId)
+                );
+            }
+        }
+
+        // --------------------------------------------------
+        // PHASE 4: ALL RESERVATIONS SUCCEEDED
+        // --------------------------------------------------
+
+        persistenceService.updateOrderStatus(
+                orderId,
+                OrderStatus.COMMITTING
+        );
+
+        /*
+         * Do not compensate if a commit fails partway through.
+         *
+         * Some reservations may already be COMMITTED and cannot be
+         * released through the normal release API.
+         *
+         * Keep COMMITTING and schedule recovery.
+         */
+
+        // --------------------------------------------------
+        // PHASE 5: COMMIT ALL RESERVATIONS
+        // --------------------------------------------------
+
+        for (OrderItem item : order.getItems()) {
+
+            try {
+
+                InventoryReservationResponse response =
+                        productClient.commitReservation(
+                                item.getProductId(),
+                                UUID.fromString(item.getReservationId())
+                        );
+
+                if (response == null
+                        || response.status()
+                        != InventoryReservationStatus.COMMITTED) {
+
+                    scheduleInitialRetry(orderId);
+
+                    return toResponse(
+                            persistenceService.findOrder(orderId)
+                    );
+                }
+
+                persistenceService.updateItemReservationStatus(
+                        orderId,
+                        item.getReservationId(),
+                        OrderItemReservationStatus.COMMITTED
+                );
+
+            } catch (RuntimeException commitFailure) {
+
+                /*
+                 * The remote commit may have succeeded even if the
+                 * response was lost or the local update failed.
+                 *
+                 * Keep COMMITTING. The recovery worker retries the
+                 * same reservation ID, relying on idempotent commit.
+                 */
+                scheduleInitialRetry(orderId);
+
+                return toResponse(
+                        persistenceService.findOrder(orderId)
+                );
+            }
+        }
+
+        // --------------------------------------------------
+        // PHASE 6: ORDER CONFIRMED
+        // --------------------------------------------------
+
+        persistenceService.updateOrderStatus(
+                orderId,
+                OrderStatus.CONFIRMED
+        );
+        Order confirmedOrder = persistenceService.findOrder(orderId);
+
+        return toResponse(
+                persistenceService.findOrder(orderId)
+        );
+    }
+
+    // --------------------------------------------------
+    // RETRY HANDLING
+    // --------------------------------------------------
+
+    private void scheduleInitialRetry(Long orderId) {
+
+        persistenceService.scheduleInitialRecoveryRetry(
+                orderId,
+                Instant.now().plus(INITIAL_RETRY_DELAY)
+        );
+    }
+
+    // --------------------------------------------------
+    // RESERVATION REJECTION CLASSIFICATION
+    // --------------------------------------------------
+
+    private boolean isDefinitiveReservationRejection(
+            FeignException exception) {
+
+        int status = exception.status();
+
+        return status == 400
+                || status == 404
+                || status == 409
+                || status == 422;
+    }
+
+    // --------------------------------------------------
+    // COMPENSATION
+    // --------------------------------------------------
+
+    /**
+     * Compensation is idempotent:
+     * release the same reservation IDs, even if a previous call timed out.
+     */
+    private boolean compensateReservations(
+            Long orderId,
+            List<OrderItem> items) {
+
+        boolean allReleased = true;
+
+        for (OrderItem item : items) {
+
+            try {
+
+                InventoryReservationResponse response =
+                        productClient.releaseReservation(
+                                item.getProductId(),
+                                UUID.fromString(item.getReservationId())
+                        );
+
+                if (response == null
+                        || response.status()
+                        != InventoryReservationStatus.RELEASED) {
+
+                    allReleased = false;
+                    continue;
+                }
+
+                persistenceService.updateItemReservationStatus(
+                        orderId,
+                        item.getReservationId(),
+                        OrderItemReservationStatus.RELEASED
+                );
+
+            } catch (FeignException.NotFound notFound) {
+
+                /*
+                 * This assumes Product Service returns 404 here only
+                 * when the reservation ID does not exist.
+                 *
+                 * If 404 can also mean that the product is missing,
+                 * do not treat it as successful compensation. The
+                 * Product Service API should distinguish these cases.
+                 */
+                persistenceService.updateItemReservationStatus(
+                        orderId,
+                        item.getReservationId(),
+                        OrderItemReservationStatus.RELEASED
+                );
+
+            } catch (RuntimeException releaseFailure) {
+
+                allReleased = false;
+            }
+        }
+
+        return allReleased;
+    }
+
+    // --------------------------------------------------
+    // READ OPERATIONS
+    // --------------------------------------------------
+
+    public OrderResponse getOrderById(Long orderId) {
+
+        return toResponse(
+                persistenceService.findOrder(orderId)
         );
     }
 
     @Transactional(readOnly = true)
-    public OrderResponse getOrderById(Long orderId) {
+    public Page<OrderResponse> getOrders(
+            Long customerId,
+            Pageable pageable) {
 
-        Order order = orderRepository.findById(orderId)
-                .orElseThrow(() -> new ResourceNotFoundException("Order not found: " + orderId));
+        Page<Order> orders = customerId != null
+                ? orderRepository.findByCustomerId(customerId, pageable)
+                : orderRepository.findAll(pageable);
+
+        return orders.map(this::toResponse);
+    }
+
+    // --------------------------------------------------
+    // ENTITY TO RESPONSE CONVERSION
+    // --------------------------------------------------
+
+    private OrderResponse toResponse(Order order) {
 
         List<OrderItemResponse> items = order.getItems()
                 .stream()
@@ -122,37 +416,5 @@ public class OrderService {
                 order.getCreatedAt(),
                 order.getUpdatedAt()
         );
-    }
-
-    @Transactional(readOnly = true)
-    public Page<OrderResponse> getOrders(Long customerId, Pageable pageable) {
-
-        Page<Order> orders = customerId != null
-                ? orderRepository.findByCustomerId(customerId, pageable)
-                : orderRepository.findAll(pageable);
-
-        return orders.map(order -> {
-
-            List<OrderItemResponse> items = order.getItems()
-                    .stream()
-                    .map(item -> new OrderItemResponse(
-                            item.getProductId(),
-                            item.getProductName(),
-                            item.getUnitPrice(),
-                            item.getQuantity(),
-                            item.getSubtotal()
-                    ))
-                    .toList();
-
-            return new OrderResponse(
-                    order.getId(),
-                    order.getCustomerId(),
-                    order.getTotalAmount(),
-                    order.getStatus(),
-                    items,
-                    order.getCreatedAt(),
-                    order.getUpdatedAt()
-            );
-        });
     }
 }
