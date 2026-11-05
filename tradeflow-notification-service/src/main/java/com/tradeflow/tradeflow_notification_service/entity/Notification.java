@@ -1,3 +1,4 @@
+
 package com.tradeflow.tradeflow_notification_service.entity;
 
 import jakarta.persistence.*;
@@ -13,6 +14,16 @@ import java.util.UUID;
                         name = "uk_notification_event_id",
                         columnNames = "event_id"
                 )
+        },
+        indexes = {
+                @Index(
+                        name = "idx_notification_customer_created",
+                        columnList = "customer_id, created_at, id"
+                ),
+                @Index(
+                        name = "idx_notification_customer_read",
+                        columnList = "customer_id, is_read"
+                )
         }
 )
 public class Notification {
@@ -24,23 +35,35 @@ public class Notification {
     @Column(name = "event_id", nullable = false, updatable = false)
     private UUID eventId;
 
-    @Column(name = "event_type", nullable = false)
+    @Column(name = "event_type", nullable = false, updatable = false)
     private String eventType;
 
-    @Column(name = "order_id", nullable = false)
+    @Column(name = "order_id", nullable = false, updatable = false)
     private Long orderId;
 
-    @Column(name = "customer_id", nullable = false)
+    @Column(name = "customer_id", nullable = false, updatable = false)
     private Long customerId;
 
-    @Column(name = "total_amount", nullable = false, precision = 19, scale = 2)
+    @Column(
+            name = "total_amount",
+            nullable = false,
+            precision = 19,
+            scale = 2,
+            updatable = false
+    )
     private BigDecimal totalAmount;
 
-    @Column(name = "occurred_at", nullable = false)
+    @Column(name = "occurred_at", nullable = false, updatable = false)
     private Instant occurredAt;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
+
+    @Column(name = "is_read", nullable = false)
+    private boolean read = false;
+
+    @Column(name = "read_at")
+    private Instant readAt;
 
     public Notification() {
     }
@@ -112,5 +135,21 @@ public class Notification {
 
     public void setCreatedAt(Instant createdAt) {
         this.createdAt = createdAt;
+    }
+
+    public boolean isRead() {
+        return read;
+    }
+
+    public void setRead(boolean read) {
+        this.read = read;
+    }
+
+    public Instant getReadAt() {
+        return readAt;
+    }
+
+    public void setReadAt(Instant readAt) {
+        this.readAt = readAt;
     }
 }
